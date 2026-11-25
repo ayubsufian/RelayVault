@@ -18,6 +18,7 @@ const requiredEnvVars = [
   'MFA_REAUTH_SECRET',
   'GOOGLE_MFA_REAUTH_REDIRECT_URI',
   'HANDOFF_ENCRYPTION_KEY',
+  'REDIS_URL',
 ];
 
 const missingEnvVars = requiredEnvVars.filter((name) => !process.env[name]);
@@ -50,4 +51,9 @@ export const env = {
   mfaReauthSecret: process.env.MFA_REAUTH_SECRET,
   googleMfaReauthRedirectUri: process.env.GOOGLE_MFA_REAUTH_REDIRECT_URI,
   handoffEncryptionKey: process.env.HANDOFF_ENCRYPTION_KEY,
+  redisUrl: process.env.REDIS_URL,
+  trustProxy:
+    process.env.TRUST_PROXY === 'true'
+      ? true
+      : Number(process.env.TRUST_PROXY || 0),
 };

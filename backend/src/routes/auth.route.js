@@ -29,25 +29,30 @@ import {
 import requireAuth from '../middleware/auth.middleware.js';
 import requireRecentAuth from '../middleware/recent-auth.middleware.js';
 import requireMfaReauth from '../middleware/mfa-reauth.middleware.js';
+import {
+  authLimiter,
+  mfaLimiter,
+  recoveryLimiter,
+} from '../middleware/rate-limit.middleware.js';
 
 const router = Router();
 
 // Account registration and login
-router.post('/register', registerUser);
-router.post('/login', loginUser);
+router.post('/register', authLimiter, registerUser);
+router.post('/login', authLimiter, loginUser);
 
 // Session lifecycle
-router.post('/refresh', refreshAccessToken);
+router.post('/refresh', authLimiter, refreshAccessToken);
 router.post('/logout', logoutUser);
 router.post('/logout-all', requireAuth, logoutAllSessions);
 router.get('/me', requireAuth, getCurrentUser);
 
 // Password and email verification
-router.post('/forgot-password', forgotPassword);
-router.post('/reset-password', resetPassword);
+router.post('/forgot-password', recoveryLimiter, forgotPassword);
+router.post('/reset-password', recoveryLimiter, resetPassword);
 router.patch('/change-password', requireAuth, changePassword);
 router.get('/verify-email', verifyEmail);
-router.post('/resend-verification', resendVerificationEmail);
+router.post('/resend-verification', recoveryLimiter, resendVerificationEmail);
 
 // Google OAuth
 router.get('/google', googleLogin);
@@ -70,7 +75,7 @@ router.post(
   startMfaSetupWithGoogle,
 );
 router.post('/mfa/confirm', requireAuth, requireRecentAuth, confirmMfaSetup);
-router.post('/mfa/verify', verifyMfa);
+router.post('/mfa/verify', mfaLimiter, verifyMfa);
 router.post(
   '/mfa/replace/start',
   requireAuth,
