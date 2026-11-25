@@ -1,5 +1,13 @@
 import { env } from '../config/env.js';
 
+const escapeHtml = (value) =>
+  String(value)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+
 const sendBrevoEmail = async ({ to, subject, textContent, htmlContent }) => {
   const response = await fetch('https://api.brevo.com/v3/smtp/email', {
     method: 'POST',
@@ -33,6 +41,7 @@ const sendBrevoEmail = async ({ to, subject, textContent, htmlContent }) => {
 const sendPasswordResetEmail = async (email, rawToken) => {
   const resetUrl =
     `${env.clientUrl}/reset-password?token=` + encodeURIComponent(rawToken);
+  const safeResetUrl = escapeHtml(resetUrl);
 
   await sendBrevoEmail({
     to: email,
@@ -48,7 +57,7 @@ const sendPasswordResetEmail = async (email, rawToken) => {
     htmlContent: `
           <p>We received a request to reset your password.</p>
           <p>
-            <a href="${resetUrl}">Reset your password</a>
+            <a href="${safeResetUrl}">Reset your password</a>
           </p>
           <p>This link expires in 15 minutes.</p>
           <p>If you did not request this, you can ignore this email.</p>
@@ -59,6 +68,7 @@ const sendPasswordResetEmail = async (email, rawToken) => {
 const sendVerificationEmail = async (email, rawToken) => {
   const verificationUrl =
     `${env.clientUrl}/verify-email?token=` + encodeURIComponent(rawToken);
+  const safeVerificationUrl = escapeHtml(verificationUrl);
 
   await sendBrevoEmail({
     to: email,
@@ -72,7 +82,7 @@ const sendVerificationEmail = async (email, rawToken) => {
     ].join('\n'),
     htmlContent: `<p>Please verify your email address.</p>
           <p>
-            <a href="${verificationUrl}">Verify email</a>
+            <a href="${safeVerificationUrl}">Verify email</a>
           </p>
           <p>This link expires in 24 hours.</p>
         `,
@@ -93,6 +103,8 @@ const sendMfaChangedEmail = async (email, action) => {
     throw new TypeError(`Unsupported MFA action: ${action}`);
   }
 
+  const safeActionText = escapeHtml(actionText);
+
   await sendBrevoEmail({
     to: email,
     subject: 'Your MFA settings changed',
@@ -102,7 +114,7 @@ const sendMfaChangedEmail = async (email, action) => {
       'If you did not make this change, reset your password and contact support immediately.',
     ].join('\n'),
     htmlContent: `
-      <p>MFA was <strong>${actionText}</strong> on your account.</p>
+      <p>MFA was <strong>${safeActionText}</strong> on your account.</p>
       <p>
         If you did not make this change, reset your password and contact
         support immediately.
@@ -111,4 +123,37 @@ const sendMfaChangedEmail = async (email, action) => {
   });
 };
 
-export { sendPasswordResetEmail, sendVerificationEmail, sendMfaChangedEmail };
+const sendHandoffEmail = async (email, { title, redemptionUrl, expiresAt }) => {
+  const expiryText = new Date(expiresAt).toISOString();
+  const safeTitle = escapeHtml(title);
+  const safeRedemptionUrl = escapeHtml(redemptionUrl);
+  const safeExpiryText = escapeHtml(expiryText);
+
+  await sendBrevoEmail({
+    to: email,
+    subject: 'You received a RelayVault handoff',
+    textContent: [
+      'Someone shared a secure RelayVault handoff with you.',
+      '',
+      `Title: ${title}`,
+      `Open it once here: ${redemptionUrl}`,
+      '',
+      `This link expires at ${expiryText}.`,
+      'Do not forward this link. RelayVault will never ask for your password through this email.',
+    ].join('\n'),
+    htmlContent: `
+      <p>Someone shared a secure RelayVault handoff with you.</p>
+      <p><strong>Title:</strong> ${safeTitle}</p>
+      <p><a href="${safeRedemptionUrl}">Open the handoff</a></p>
+      <p>This link can be used once and expires at ${safeExpiryText}.</p>
+      <p>Do not forward this link. RelayVault will never ask for your password through this email.</p>
+    `,
+  });
+};
+
+export {
+  sendPasswordResetEmail,
+  sendVerificationEmail,
+  sendMfaChangedEmail,
+  sendHandoffEmail,
+};

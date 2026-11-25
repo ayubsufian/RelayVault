@@ -30,11 +30,14 @@ const registerUserService = async (username, email, password) => {
     return null;
   }
 
-  const user = await User.create({
-    username,
-    email,
-    password,
-  });
+  let user;
+
+  try {
+    user = await User.create({ username, email, password });
+  } catch (error) {
+    if (error.code === 11000) return null;
+    throw error;
+  }
 
   await sendVerificationEmailService(user);
 
@@ -97,6 +100,15 @@ const refreshAccessTokenService = async (refreshToken) => {
     return null;
   }
 
+  if (
+    typeof payload.auth_time !== 'number' ||
+    !Number.isFinite(payload.auth_time) ||
+    !Array.isArray(payload.amr) ||
+    payload.amr.length === 0
+  ) {
+    return null;
+  }
+
   const tokenHash = hashToken(refreshToken);
 
   const session = await Session.findOne({ tokenHash, userId: payload.sub });
@@ -124,32 +136,84 @@ const refreshAccessTokenService = async (refreshToken) => {
     return null;
   }
 
+  const authTime = payload.auth_time;
+  const authMethods = payload.amr;
+
+  if (!Number.isFinite(authTime) || authTime > Math.floor(Date.now() / 1000)) {
+    return null;
+  }
+
   const accessToken = jwt.sign(
-    { sub: user._id.toString() },
+    {
+      sub: user._id.toString(),
+      auth_time: authTime,
+      amr: authMethods,
+    },
     env.accessTokenSecret,
     { expiresIn: '15m' },
   );
 
-  const newRefreshToken = createRefreshToken(user._id);
+  const newRefreshToken = createRefreshToken(
+    user._id,
+    authTime,
+    authMethods,
+  );
   const newTokenHash = hashToken(newRefreshToken);
 
-  session.revokedAt = new Date();
-  session.replacedByTokenHash = newTokenHash;
-
-  await session.save();
+  const dbSession = await mongoose.startSession();
 
   try {
-    await Session.create({
-      userId: user._id,
-      tokenHash: hashToken(refreshToken),
-      expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+    let rotated = false;
+
+    await dbSession.withTransaction(async () => {
+      const claimedSession = await Session.findOneAndUpdate(
+        {
+          _id: session._id,
+          tokenHash,
+          revokedAt: null,
+          expiresAt: { $gt: new Date() },
+        },
+        {
+          $set: {
+            revokedAt: new Date(),
+            replacedByTokenHash: newTokenHash,
+          },
+        },
+        { new: true, session: dbSession },
+      );
+
+      if (!claimedSession) {
+        await Session.updateMany(
+          { userId: session.userId, revokedAt: null },
+          { $set: { revokedAt: new Date() } },
+          { session: dbSession },
+        );
+        return;
+      }
+
+      await Session.create(
+        [
+          {
+            userId: user._id,
+            tokenHash: newTokenHash,
+            expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+          },
+        ],
+        { session: dbSession },
+      );
+
+      rotated = true;
     });
+
+    if (!rotated) return null;
   } catch (error) {
     throw new ServiceError(
-      'Unable to create a session',
+      'Unable to rotate the session',
       'SESSION_CREATION_FAILED',
       { cause: error },
     );
+  } finally {
+    await dbSession.endSession();
   }
 
   return { accessToken, refreshToken: newRefreshToken };
@@ -169,11 +233,13 @@ const logoutUserService = async (refreshToken) => {
   );
 };
 
-const createRefreshToken = (userId) => {
+const createRefreshToken = (userId, authTime, authMethods = ['pwd']) => {
   return jwt.sign(
     {
       sub: userId.toString(),
       jti: crypto.randomUUID(),
+      auth_time: authTime,
+      amr: authMethods,
     },
     env.refreshTokenSecret,
     { expiresIn: '7d' },
@@ -231,34 +297,37 @@ const requestPasswordResetService = async (email) => {
 };
 
 const resetPasswordService = async (rawToken, newPassword) => {
-  const resetRequest = await PasswordReset.findOne({
-    tokenHash: hashToken(rawToken),
-    usedAt: null,
-    expiresAt: { $gt: new Date() },
-  });
+  const dbSession = await mongoose.startSession();
 
-  if (!resetRequest) {
-    return false;
+  try {
+    let success = false;
+
+    await dbSession.withTransaction(async () => {
+      const resetRequest = await PasswordReset.findOneAndUpdate(
+        {
+          tokenHash: hashToken(rawToken),
+          usedAt: null,
+          expiresAt: { $gt: new Date() },
+        },
+        { $set: { usedAt: new Date() } },
+        { new: true, session: dbSession },
+      );
+
+      if (!resetRequest) return;
+
+      const user = await User.findById(resetRequest.userId).session(dbSession);
+      if (!user) return;
+
+      user.password = newPassword;
+      await user.save({ session: dbSession });
+      await revokeActiveSessions(user._id, dbSession);
+      success = true;
+    });
+
+    return success;
+  } finally {
+    await dbSession.endSession();
   }
-
-  const user = await User.findById(resetRequest.userId);
-
-  if (!user) {
-    return false;
-  }
-
-  user.password = newPassword;
-  await user.save(); // pre-save hook hashes the password
-
-  resetRequest.usedAt = new Date();
-  await resetRequest.save();
-
-  await Session.updateMany(
-    { userId: user._id, revokedAt: null },
-    { revokedAt: new Date() },
-  );
-
-  return true;
 };
 
 const changePasswordService = async (userId, currentPassword, newPassword) => {
@@ -316,29 +385,36 @@ const sendVerificationEmailService = async (user) => {
 };
 
 const verifyEmailService = async (rawToken) => {
-  const verification = await EmailVerification.findOne({
-    tokenHash: hashToken(rawToken),
-    usedAt: null,
-    expiresAt: { $gt: new Date() },
-  });
+  const dbSession = await mongoose.startSession();
 
-  if (!verification) {
-    return false;
+  try {
+    let verified = false;
+
+    await dbSession.withTransaction(async () => {
+      const verification = await EmailVerification.findOneAndUpdate(
+        {
+          tokenHash: hashToken(rawToken),
+          usedAt: null,
+          expiresAt: { $gt: new Date() },
+        },
+        { $set: { usedAt: new Date() } },
+        { new: true, session: dbSession },
+      );
+
+      if (!verification) return;
+
+      const user = await User.findById(verification.userId).session(dbSession);
+      if (!user) return;
+
+      user.isEmailVerified = true;
+      await user.save({ session: dbSession });
+      verified = true;
+    });
+
+    return verified;
+  } finally {
+    await dbSession.endSession();
   }
-
-  const user = await User.findById(verification.userId);
-
-  if (!user) {
-    return false;
-  }
-
-  user.isEmailVerified = true;
-  await user.save();
-
-  verification.usedAt = new Date();
-  await verification.save();
-
-  return true;
 };
 
 const resendVerificationEmailService = async (email) => {
@@ -421,8 +497,14 @@ const createGoogleUser = async (googleProfile) => {
       const duplicateUsername =
         error.code === 11000 && error.keyPattern?.username;
 
-      if (!duplicateUsername) {
+      const duplicateEmail = error.code === 11000 && error.keyPattern?.email;
+
+      if (!duplicateUsername && !duplicateEmail) {
         throw error;
+      }
+
+      if (duplicateEmail) {
+        return null;
       }
       lastError = error;
     }
@@ -485,25 +567,37 @@ const completeGoogleLoginService = async ({
   return loginWithGoogleService(payload);
 };
 
-const createApplicationTokens = async (user, authMethods = ['pwd']) => {
+const createApplicationTokens = async (
+  user,
+  authMethods = ['pwd'],
+  dbSession = null,
+) => {
+  const authTime = Math.floor(Date.now() / 1000);
+
   const accessToken = jwt.sign(
     {
       sub: user._id.toString(),
-      auth_time: Math.floor(Date.now() / 1000),
+      auth_time: authTime,
       amr: authMethods,
     },
     env.accessTokenSecret,
     { expiresIn: '15m' },
   );
 
-  const refreshToken = createRefreshToken(user._id);
+  const refreshToken = createRefreshToken(user._id, authTime, authMethods);
 
   try {
-    await Session.create({
+    const sessionDocument = {
       userId: user._id,
       tokenHash: hashToken(refreshToken),
       expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
-    });
+    };
+
+    if (dbSession) {
+      await Session.create([sessionDocument], { session: dbSession });
+    } else {
+      await Session.create(sessionDocument);
+    }
   } catch (error) {
     throw new ServiceError(
       'Unable to create a session',
@@ -534,6 +628,10 @@ const loginWithGoogleService = async (googleProfile) => {
     }
 
     user = await createGoogleUser(googleProfile);
+
+    if (!user) {
+      return { emailConflict: true };
+    }
   }
 
   const tokens = await createApplicationTokens(user, ['google']);
@@ -552,6 +650,7 @@ const startGoogleLinkService = async (userId) => {
     userId,
     state,
     codeVerifier: verifier,
+    purpose: 'account-link',
     expiresAt: new Date(Date.now() + 10 * 60 * 1000),
   });
 
@@ -572,13 +671,18 @@ const completeGoogleLinkService = async (code, state) => {
     return { invalid: true };
   }
 
-  const transaction = await OAuthLink.findOne({ state });
+  const transaction = await OAuthLink.findOneAndUpdate(
+    {
+      state,
+      purpose: 'account-link',
+      claimedAt: null,
+      expiresAt: { $gt: new Date() },
+    },
+    { $set: { claimedAt: new Date() } },
+    { new: true },
+  );
 
-  if (!transaction || transaction.expiresAt <= new Date()) {
-    if (transaction) {
-      await OAuthLink.deleteOne({ _id: transaction._id });
-    }
-
+  if (!transaction) {
     return { invalid: true };
   }
 
@@ -661,6 +765,17 @@ const normalizeRecoveryCode = (code) => {
   return /^[A-F0-9]{16}$/.test(normalized) ? normalized : null;
 };
 
+const revokeActiveSessions = (userId, dbSession = null) => {
+  const query = Session.updateMany(
+    { userId, revokedAt: null },
+    { $set: { revokedAt: new Date() } },
+  );
+
+  if (dbSession) query.session(dbSession);
+
+  return query;
+};
+
 const createPendingTotpFactor = async (userId, email) => {
   if (!userId || !mongoose.isObjectIdOrHexString(userId)) {
     return { error: MFA_ERROR.INVALID };
@@ -737,14 +852,14 @@ const createRecoveryCodesService = async (userId) => {
   return rawCodes;
 };
 
-const consumeRecoveryCodeService = async (userId, rawCode) => {
+const consumeRecoveryCodeService = async (userId, rawCode, dbSession = null) => {
   const normalizedCode = normalizeRecoveryCode(rawCode);
 
   if (!normalizedCode) {
     return null;
   }
 
-  return MfaRecoveryCode.findOneAndUpdate(
+  const query = MfaRecoveryCode.findOneAndUpdate(
     {
       userId,
       codeHash: hashToken(normalizedCode),
@@ -759,66 +874,92 @@ const consumeRecoveryCodeService = async (userId, rawCode) => {
       new: true,
     },
   );
+
+  if (dbSession) query.session(dbSession);
+
+  return query;
 };
 
 const verifyRecoveryCodeService = async (rawChallenge, recoveryCode) => {
-  const challenge = await MfaChallenge.findOne({
-    challengeHash: hashToken(rawChallenge),
-  });
+  const dbSession = await mongoose.startSession();
 
-  if (!challenge || challenge.usedAt) {
-    return { error: MFA_ERROR.INVALID };
+  try {
+    let result;
+
+    await dbSession.withTransaction(async () => {
+      const challenge = await MfaChallenge.findOne({
+        challengeHash: hashToken(rawChallenge),
+      }).session(dbSession);
+
+      if (!challenge || challenge.usedAt) {
+        result = { error: MFA_ERROR.INVALID };
+        return;
+      }
+
+      if (challenge.expiresAt <= new Date()) {
+        result = { error: MFA_ERROR.EXPIRED };
+        return;
+      }
+
+      const claimedAttempt = await MfaChallenge.findOneAndUpdate(
+        {
+          _id: challenge._id,
+          usedAt: null,
+          expiresAt: { $gt: new Date() },
+          attempts: { $lt: 5 },
+        },
+        { $inc: { attempts: 1 } },
+        { new: true, session: dbSession },
+      );
+
+      if (!claimedAttempt) {
+        result = { error: MFA_ERROR.TOO_MANY_ATTEMPTS };
+        return;
+      }
+
+      const consumedCode = await consumeRecoveryCodeService(
+        challenge.userId,
+        recoveryCode,
+        dbSession,
+      );
+
+      if (!consumedCode) {
+        result = { error: MFA_ERROR.INVALID };
+        return;
+      }
+
+      const claimedChallenge = await MfaChallenge.findOneAndUpdate(
+        { _id: challenge._id, usedAt: null },
+        { $set: { usedAt: new Date() } },
+        { new: true, session: dbSession },
+      );
+
+      if (!claimedChallenge) {
+        result = { error: MFA_ERROR.INVALID };
+        return;
+      }
+
+      const user = await User.findById(challenge.userId).session(dbSession);
+
+      if (!user) {
+        result = { error: MFA_ERROR.INVALID };
+        return;
+      }
+
+      result = {
+        success: true,
+        ...(await createApplicationTokens(
+          user,
+          ['pwd', 'recovery'],
+          dbSession,
+        )),
+      };
+    });
+
+    return result;
+  } finally {
+    await dbSession.endSession();
   }
-
-  if (challenge.expiresAt <= new Date()) {
-    return { error: MFA_ERROR.EXPIRED };
-  }
-
-  if (challenge.attempts >= 5) {
-    return { error: MFA_ERROR.TOO_MANY_ATTEMPTS };
-  }
-
-  await MfaChallenge.updateOne(
-    { _id: challenge._id },
-    { $inc: { attempts: 1 } },
-  );
-
-  const consumedCode = await consumeRecoveryCodeService(
-    challenge.userId,
-    recoveryCode,
-  );
-
-  if (!consumedCode) {
-    return { error: MFA_ERROR.INVALID };
-  }
-
-  const claimedChallenge = await MfaChallenge.findOneAndUpdate(
-    {
-      _id: challenge._id,
-      usedAt: null,
-    },
-    {
-      $set: {
-        usedAt: new Date(),
-      },
-    },
-    { new: true },
-  );
-
-  if (!claimedChallenge) {
-    return { error: MFA_ERROR.INVALID };
-  }
-
-  const user = await User.findById(challenge.userId);
-
-  if (!user) {
-    return { error: MFA_ERROR.INVALID };
-  }
-
-  return {
-    success: true,
-    ...(await createApplicationTokens(user, ['pwd', 'recovery'])),
-  };
 };
 
 const regenerateRecoveryCodesService = async ({
@@ -869,17 +1010,7 @@ const regenerateRecoveryCodesService = async ({
 
   const recoveryCodes = await createRecoveryCodesService(userId);
 
-  await Session.updateMany(
-    {
-      userId,
-      revokedAt: null,
-    },
-    {
-      $set: {
-        revokedAt: new Date(),
-      },
-    },
-  );
+  await revokeActiveSessions(userId);
 
   sendMfaChangedEmail(user.email, 'recovery-codes-regenerated').catch(
     (error) => {
@@ -1049,17 +1180,7 @@ const confirmMfaSetupService = async (userId, code) => {
 
   const recoveryCodes = await createRecoveryCodesService(userId);
 
-  await Session.updateMany(
-    {
-      userId,
-      revokedAt: null,
-    },
-    {
-      $set: {
-        revokedAt: new Date(),
-      },
-    },
-  );
+  await revokeActiveSessions(userId);
 
   sendMfaChangedEmail(user.email, 'enabled').catch((error) => {
     console.error('MFA notification failed', {
@@ -1126,92 +1247,105 @@ const verifyMfaService = async (rawChallenge, code) => {
   if (!isValidTotpCode(code)) {
     return { error: MFA_ERROR.INVALID };
   }
+  const dbSession = await mongoose.startSession();
 
-  const challenge = await MfaChallenge.findOne({
-    challengeHash: hashToken(rawChallenge),
-  });
+  try {
+    let result;
 
-  if (!challenge || challenge.usedAt) {
-    return { error: MFA_ERROR.INVALID };
+    await dbSession.withTransaction(async () => {
+      const challenge = await MfaChallenge.findOne({
+        challengeHash: hashToken(rawChallenge),
+      }).session(dbSession);
+
+      if (!challenge || challenge.usedAt) {
+        result = { error: MFA_ERROR.INVALID };
+        return;
+      }
+      if (challenge.expiresAt <= new Date()) {
+        result = { error: MFA_ERROR.EXPIRED };
+        return;
+      }
+
+      const claimedAttempt = await MfaChallenge.findOneAndUpdate(
+        {
+          _id: challenge._id,
+          usedAt: null,
+          expiresAt: { $gt: new Date() },
+          attempts: { $lt: 5 },
+        },
+        { $inc: { attempts: 1 } },
+        { new: true, session: dbSession },
+      );
+
+      if (!claimedAttempt) {
+        result = { error: MFA_ERROR.TOO_MANY_ATTEMPTS };
+        return;
+      }
+
+      const factor = await MfaFactor.findOne({
+        userId: challenge.userId,
+        enabledAt: { $ne: null },
+      }).session(dbSession);
+
+      if (!factor) {
+        result = { error: MFA_ERROR.INVALID };
+        return;
+      }
+
+      const valid = authenticator.verify({
+        token: code,
+        secret: decryptSecret(factor.secretEncrypted),
+      });
+
+      if (!valid) {
+        result = { error: MFA_ERROR.INVALID };
+        return;
+      }
+
+      const currentStep = Math.floor(Date.now() / 30000);
+      const claimedFactor = await MfaFactor.findOneAndUpdate(
+        {
+          _id: factor._id,
+          userId: challenge.userId,
+          enabledAt: { $ne: null },
+          lastUsedStep: { $ne: currentStep },
+        },
+        { $set: { lastUsedStep: currentStep } },
+        { new: true, session: dbSession },
+      );
+
+      if (!claimedFactor) {
+        result = { error: MFA_ERROR.INVALID };
+        return;
+      }
+
+      const claimedChallenge = await MfaChallenge.findOneAndUpdate(
+        { _id: challenge._id, usedAt: null },
+        { $set: { usedAt: new Date() } },
+        { new: true, session: dbSession },
+      );
+
+      if (!claimedChallenge) {
+        result = { error: MFA_ERROR.INVALID };
+        return;
+      }
+
+      const user = await User.findById(challenge.userId).session(dbSession);
+      if (!user) {
+        result = { error: MFA_ERROR.INVALID };
+        return;
+      }
+
+      result = {
+        success: true,
+        ...(await createApplicationTokens(user, ['pwd', 'totp'], dbSession)),
+      };
+    });
+
+    return result;
+  } finally {
+    await dbSession.endSession();
   }
-
-  if (challenge.expiresAt <= new Date()) {
-    return { error: MFA_ERROR.EXPIRED };
-  }
-
-  if (challenge.attempts >= 5) {
-    return { error: MFA_ERROR.TOO_MANY_ATTEMPTS };
-  }
-
-  await MfaChallenge.updateOne(
-    { _id: challenge._id },
-    { $inc: { attempts: 1 } },
-  );
-
-  const factor = await MfaFactor.findOne({
-    userId: challenge.userId,
-    enabledAt: { $ne: null },
-  });
-
-  if (!factor) {
-    return { error: MFA_ERROR.INVALID };
-  }
-
-  const valid = authenticator.verify({
-    token: code,
-    secret: decryptSecret(factor.secretEncrypted),
-  });
-
-  if (!valid) {
-    return { error: MFA_ERROR.INVALID };
-  }
-
-  const currentStep = Math.floor(Date.now() / 30000);
-
-  const claimedFactor = await MfaFactor.findOneAndUpdate(
-    {
-      _id: factor._id,
-      lastUsedStep: { $ne: currentStep },
-    },
-    {
-      $set: { lastUsedStep: currentStep },
-    },
-    {
-      new: true,
-    },
-  );
-
-  if (!claimedFactor) {
-    return { error: MFA_ERROR.INVALID };
-  }
-
-  const claimedChallenge = await MfaChallenge.findOneAndUpdate(
-    {
-      _id: challenge._id,
-      usedAt: null,
-    },
-    {
-      $set: {
-        usedAt: new Date(),
-      },
-    },
-    { new: true },
-  );
-
-  if (!claimedChallenge) {
-    return { error: MFA_ERROR.INVALID };
-  }
-
-  const user = await User.findById(challenge.userId);
-
-  if (!user) {
-    return { error: MFA_ERROR.INVALID };
-  }
-
-  return {
-    success: true,
-    ...(await createApplicationTokens(user, ['pwd', 'totp'])),
-  };
 };
 
 const startMfaReplacementService = async (userId, code) => {
@@ -1332,17 +1466,7 @@ const confirmMfaReplacementService = async (userId, code) => {
     return { error: MFA_ERROR.INVALID };
   }
 
-  await Session.updateMany(
-    {
-      userId,
-      revokedAt: null,
-    },
-    {
-      $set: {
-        revokedAt: new Date(),
-      },
-    },
-  );
+  await revokeActiveSessions(userId);
 
   sendMfaChangedEmail(user.email, 'replaced').catch((error) => {
     console.error('MFA replacement notification failed', {
@@ -1444,14 +1568,7 @@ const disableMfaService = async ({
 
   await MfaRecoveryCode.deleteMany({ userId });
 
-  await Session.updateMany(
-    { userId, revokedAt: null },
-    {
-      $set: {
-        revokedAt: new Date(),
-      },
-    },
-  );
+  await revokeActiveSessions(userId);
 
   sendMfaChangedEmail(user.email, 'disabled').catch((error) => {
     console.error('MFA disable notification failed', {

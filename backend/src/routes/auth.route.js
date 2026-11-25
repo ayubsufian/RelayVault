@@ -32,31 +32,36 @@ import requireMfaReauth from '../middleware/mfa-reauth.middleware.js';
 
 const router = Router();
 
-// Registration and login
-router.route('/register').post(registerUser);
-router.route('/login').post(loginUser);
+// Account registration and login
+router.post('/register', registerUser);
+router.post('/login', loginUser);
 
-// Token and session management
-router.route('/refresh').post(refreshAccessToken);
-router.route('/logout').post(logoutUser);
-router.route('/logout-all').post(requireAuth, logoutAllSessions);
-router.route('/me').get(requireAuth, getCurrentUser);
+// Session lifecycle
+router.post('/refresh', refreshAccessToken);
+router.post('/logout', logoutUser);
+router.post('/logout-all', requireAuth, logoutAllSessions);
+router.get('/me', requireAuth, getCurrentUser);
 
-// Password management
-router.route('/forgot-password').post(forgotPassword);
-router.route('/reset-password').post(resetPassword);
-router.route('/change-password').patch(requireAuth, changePassword);
-
-// Email verification
-router.route('/verify-email').get(verifyEmail);
-router.route('/resend-verification').post(resendVerificationEmail);
+// Password and email verification
+router.post('/forgot-password', forgotPassword);
+router.post('/reset-password', resetPassword);
+router.patch('/change-password', requireAuth, changePassword);
+router.get('/verify-email', verifyEmail);
+router.post('/resend-verification', resendVerificationEmail);
 
 // Google OAuth
-router.route('/google').get(googleLogin);
-router.route('/google/callback').get(googleCallback);
+router.get('/google', googleLogin);
+router.get('/google/callback', googleCallback);
 router.get('/google/link', requireAuth, googleLinkStart);
 router.get('/google/link/callback', googleLinkCallback);
 
+// MFA setup and lifecycle
+router.post(
+  '/mfa/setup/password',
+  requireAuth,
+  requireRecentAuth,
+  startMfaSetupWithPassword,
+);
 router.post(
   '/mfa/setup/google',
   requireAuth,
@@ -64,13 +69,8 @@ router.post(
   requireMfaReauth,
   startMfaSetupWithGoogle,
 );
-router.post(
-  '/mfa/setup/password',
-  requireAuth,
-  requireRecentAuth,
-  startMfaSetupWithPassword,
-);
 router.post('/mfa/confirm', requireAuth, requireRecentAuth, confirmMfaSetup);
+router.post('/mfa/verify', verifyMfa);
 router.post(
   '/mfa/replace/start',
   requireAuth,
@@ -84,16 +84,15 @@ router.post(
   confirmMfaReplacement,
 );
 router.post('/mfa/disable', requireAuth, requireRecentAuth, disableMfa);
-router.post('/mfa/verify', verifyMfa);
-
-router.get('/google/mfa-reauth', requireAuth, startGoogleMfaReauth);
-router.get('/google/mfa-reauth/callback', completeGoogleMfaReauth);
-
 router.post(
   '/mfa/recovery-codes/regenerate',
   requireAuth,
   requireRecentAuth,
   regenerateRecoveryCodes,
 );
+
+// Google MFA reauthentication
+router.get('/google/mfa-reauth', requireAuth, startGoogleMfaReauth);
+router.get('/google/mfa-reauth/callback', completeGoogleMfaReauth);
 
 export default router;

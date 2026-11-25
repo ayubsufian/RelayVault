@@ -17,6 +17,7 @@ const requiredEnvVars = [
   'MFA_ENCRYPTION_KEY',
   'MFA_REAUTH_SECRET',
   'GOOGLE_MFA_REAUTH_REDIRECT_URI',
+  'HANDOFF_ENCRYPTION_KEY',
 ];
 
 const missingEnvVars = requiredEnvVars.filter((name) => !process.env[name]);
@@ -48,4 +49,5 @@ export const env = {
   mfaEncryptionKey: process.env.MFA_ENCRYPTION_KEY,
   mfaReauthSecret: process.env.MFA_REAUTH_SECRET,
   googleMfaReauthRedirectUri: process.env.GOOGLE_MFA_REAUTH_REDIRECT_URI,
+  handoffEncryptionKey: process.env.HANDOFF_ENCRYPTION_KEY,
 };

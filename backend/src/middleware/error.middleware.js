@@ -19,6 +19,42 @@ const serviceErrorResponses = {
     statusCode: 503,
     message: 'Unable to create a session right now',
   },
+  HANDOFF_INVALID_ID: {
+    statusCode: 400,
+    message: 'Invalid handoff identifier',
+  },
+  HANDOFF_VALIDATION_FAILED: {
+    statusCode: 400,
+    message: 'Invalid handoff data',
+  },
+  HANDOFF_NOT_FOUND: {
+    statusCode: 404,
+    message: 'Handoff not found',
+  },
+  HANDOFF_EDIT_CONFLICT: {
+    statusCode: 409,
+    message: 'Handoff cannot be edited in its current state',
+  },
+  HANDOFF_SHARE_CONFLICT: {
+    statusCode: 409,
+    message: 'Handoff cannot be shared in its current state',
+  },
+  HANDOFF_EXPIRED: {
+    statusCode: 409,
+    message: 'Handoff has expired',
+  },
+  HANDOFF_SHARE_FAILED: {
+    statusCode: 409,
+    message: 'Handoff could not be shared',
+  },
+  HANDOFF_UNAVAILABLE: {
+    statusCode: 410,
+    message: 'Invalid or unavailable handoff',
+  },
+  HANDOFF_DECRYPTION_FAILED: {
+    statusCode: 500,
+    message: 'Handoff could not be opened',
+  },
 };
 
 const errorHandler = (error, req, res, next) => {
