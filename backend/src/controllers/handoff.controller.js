@@ -24,7 +24,7 @@ const createHandoff = async (req, res) => {
     ownerId: req.userId,
     title: req.body.title,
     instructions: req.body.instructions,
-    recipientEmail: req.body.recipientEmail,
+    recipientEmails: req.body.recipientEmails ?? req.body.recipientEmail,
     expiresAt: req.body.expiresAt,
   });
 
@@ -59,6 +59,7 @@ const updateHandoff = async (req, res) => {
   const allowedFields = [
     'title',
     'instructions',
+    'recipientEmails',
     'recipientEmail',
     'expiresAt',
   ];
@@ -66,6 +67,14 @@ const updateHandoff = async (req, res) => {
   const unknownFields = Object.keys(req.body).filter(
     (field) => !allowedFields.includes(field),
   );
+
+  if (req.body.recipientEmail !== undefined && req.body.recipientEmails !== undefined) {
+    throw new HttpError('Use recipientEmails instead of recipientEmail', 400);
+  }
+  if (req.body.recipientEmail !== undefined) {
+    req.body.recipientEmails = req.body.recipientEmail;
+    delete req.body.recipientEmail;
+  }
 
   if (unknownFields.length > 0) {
     throw new HttpError(`Unsupported update field: ${unknownFields[0]}`, 400);

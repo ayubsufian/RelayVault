@@ -49,6 +49,16 @@ const enqueueHandoffEmail = (options) =>
     },
   });
 
+const enqueueHandoffEmails = async ({ recipientEmails, ...options }) =>
+  Promise.all(recipientEmails.map((recipientEmail, recipientIndex) =>
+    enqueueHandoffEmail({
+      ...options,
+      recipientEmail,
+      recipientIndex,
+      idempotencyKey: `${options.idempotencyKey}:${recipientIndex}`,
+    }),
+  ));
+
 const enqueuePasswordResetEmail = (options) =>
   enqueueEmail({
     ...options,
@@ -185,6 +195,7 @@ const startEmailOutboxWorker = ({ intervalMs = 5_000 } = {}) => {
 
 export {
   enqueueHandoffEmail,
+  enqueueHandoffEmails,
   enqueuePasswordResetEmail,
   enqueueVerificationEmail,
   enqueueMfaChangedEmail,

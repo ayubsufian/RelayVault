@@ -35,6 +35,7 @@ const emailOutboxSchema = new Schema(
       trim: true,
       maxlength: 254,
     },
+    recipientIndex: { type: Number, min: 0, default: 0 },
     payloadEncrypted: {
       type: String,
       required: true,

@@ -3,7 +3,7 @@ import mongoose from 'mongoose';
 import { Handoff } from '../models/handoff.model.js';
 import { HandoffToken } from '../models/handoff-token.model.js';
 import { HandoffEvent } from '../models/handoff-event.model.js';
-import { enqueueHandoffEmail } from './email-outbox.service.js';
+import { enqueueHandoffEmails } from './email-outbox.service.js';
 import { EmailOutbox } from '../models/email-outbox.model.js';
 import { encryptHandoff, decryptHandoff } from '../utils/secret-crypto.js';
 import { hashToken } from '../utils/token.js';
@@ -13,12 +13,20 @@ import ServiceError from '../utils/service-error.js';
 const MAX_TITLE_LENGTH = 120;
 const MAX_INSTRUCTIONS_LENGTH = 20_000;
 const MAX_HANDOFF_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
+const MAX_RECIPIENTS = 50;
 
 const isValidId = (value) => mongoose.isObjectIdOrHexString(value);
 const normalizeText = (value) =>
   typeof value === 'string' ? value.trim() : '';
 const normalizeEmail = (value) => normalizeText(value).toLowerCase();
 const isValidEmail = (value) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+const normalizeEmails = (value) => [...new Set((Array.isArray(value) ? value : [value]).map(normalizeEmail))];
+const validateEmails = (emails) => {
+  if (emails.length < 1 || emails.length > MAX_RECIPIENTS || emails.some((email) => !isValidEmail(email))) {
+    throw new ServiceError('Provide between 1 and 50 valid recipient emails', 'HANDOFF_VALIDATION_FAILED');
+  }
+};
+const getRecipientEmails = (handoff) => handoff.recipientEmails?.length ? handoff.recipientEmails : [handoff.recipientEmail];
 
 const assertOwnerId = (ownerId) => {
   if (!isValidId(ownerId))
@@ -58,7 +66,7 @@ const getEffectiveStatus = (handoff) => {
 const toOwnerResponse = (handoff) => ({
   id: handoff._id,
   title: handoff.title,
-  recipientEmail: handoff.recipientEmail,
+  recipientEmails: getRecipientEmails(handoff),
   expiresAt: handoff.expiresAt,
   status: getEffectiveStatus(handoff),
   viewedAt: handoff.viewedAt,
@@ -93,13 +101,13 @@ const createHandoffService = async ({
   ownerId,
   title,
   instructions,
-  recipientEmail,
+  recipientEmails,
   expiresAt,
 }) => {
   assertOwnerId(ownerId);
   const normalizedTitle = normalizeText(title);
   const normalizedInstructions = normalizeText(instructions);
-  const normalizedEmail = normalizeEmail(recipientEmail);
+  const normalizedEmails = normalizeEmails(recipientEmails);
 
   if (!normalizedTitle || normalizedTitle.length > MAX_TITLE_LENGTH) {
     throw new ServiceError(
@@ -116,12 +124,7 @@ const createHandoffService = async ({
       'HANDOFF_VALIDATION_FAILED',
     );
   }
-  if (!isValidEmail(normalizedEmail)) {
-    throw new ServiceError(
-      'A valid recipient email is required',
-      'HANDOFF_VALIDATION_FAILED',
-    );
-  }
+  validateEmails(normalizedEmails);
 
   const dbSession = await mongoose.startSession();
   let handoff;
@@ -133,7 +136,7 @@ const createHandoffService = async ({
           ownerId,
           title: normalizedTitle,
           instructionsEncrypted: encryptHandoff(normalizedInstructions),
-          recipientEmail: normalizedEmail,
+          recipientEmails: normalizedEmails,
           expiresAt: parseFutureExpiry(expiresAt),
           status: 'draft',
         }],
@@ -175,12 +178,12 @@ const getHandoffDeliveryStatusService = async (ownerId, handoffId) => {
     throw new ServiceError('Handoff not found', 'HANDOFF_NOT_FOUND');
   }
 
-  const job = await EmailOutbox.findOne({ aggregateId: handoffId })
-    .sort({ createdAt: -1 })
-    .select('status attempts nextAttemptAt sentAt completedAt lastError providerMessageId')
+  const jobs = await EmailOutbox.find({ aggregateId: handoffId, type: 'handoff-shared' })
+    .sort({ recipientIndex: 1 })
+    .select('recipientEmail recipientIndex status attempts nextAttemptAt sentAt completedAt lastError providerMessageId')
     .lean();
 
-  return job || { status: 'not-shared' };
+  return jobs.length ? { recipients: jobs } : { status: 'not-shared' };
 };
 
 const updateHandoffService = async (ownerId, handoffId, updates) => {
@@ -219,15 +222,10 @@ const updateHandoffService = async (ownerId, handoffId, updates) => {
     }
     updateData.instructionsEncrypted = encryptHandoff(instructions);
   }
-  if (updates.recipientEmail !== undefined) {
-    const email = normalizeEmail(updates.recipientEmail);
-    if (!isValidEmail(email)) {
-      throw new ServiceError(
-        'A valid recipient email is required',
-        'HANDOFF_VALIDATION_FAILED',
-      );
-    }
-    updateData.recipientEmail = email;
+  if (updates.recipientEmails !== undefined) {
+    const emails = normalizeEmails(updates.recipientEmails);
+    validateEmails(emails);
+    updateData.recipientEmails = emails;
   }
   if (updates.expiresAt !== undefined)
     updateData.expiresAt = parseFutureExpiry(updates.expiresAt);
@@ -287,9 +285,9 @@ const shareHandoffService = async (ownerId, handoffId, metadata = {}) => {
         { session: dbSession },
       );
 
-      await enqueueHandoffEmail({
+      await enqueueHandoffEmails({
         handoffId: handoff._id,
-        recipientEmail: handoff.recipientEmail,
+        recipientEmails: getRecipientEmails(handoff),
         title: handoff.title,
         redemptionUrl: `${env.clientUrl}/redeem/${encodeURIComponent(rawToken)}`,
         expiresAt: handoff.expiresAt,

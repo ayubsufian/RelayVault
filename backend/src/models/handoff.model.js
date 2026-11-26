@@ -19,9 +19,10 @@ const handoffSchema = new Schema(
       type: String,
       required: true,
     },
-    recipientEmail: {
-      type: String,
+    recipientEmails: {
+      type: [String],
       required: true,
+      validate: { validator: (emails) => emails.length >= 1 && emails.length <= 50 },
       lowercase: true,
       trim: true,
       maxlength: 254,
