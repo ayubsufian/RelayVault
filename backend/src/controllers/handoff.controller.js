@@ -2,6 +2,7 @@ import {
   createHandoffService,
   getHandoffsService,
   getHandoffService,
+  getHandoffDeliveryStatusService,
   updateHandoffService,
   shareHandoffService,
   revokeHandoffService,
@@ -41,6 +42,15 @@ const getHandoffs = async (req, res) => {
 const getHandoff = async (req, res) => {
   const handoff = await getHandoffService(req.userId, req.params.id);
   return res.status(200).json({ handoff });
+};
+
+const getHandoffDeliveryStatus = async (req, res) => {
+  const delivery = await getHandoffDeliveryStatusService(
+    req.userId,
+    req.params.id,
+  );
+
+  return res.status(200).json({ delivery });
 };
 
 const updateHandoff = async (req, res) => {
@@ -115,6 +125,7 @@ export {
   createHandoff,
   getHandoffs,
   getHandoff,
+  getHandoffDeliveryStatus,
   updateHandoff,
   shareHandoff,
   revokeHandoff,

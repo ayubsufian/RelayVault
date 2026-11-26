@@ -2,11 +2,13 @@ import { env } from './config/env.js';
 import connectDB from './config/database.js';
 import { connectRedis } from './config/redis.js';
 import app from './app.js';
+import { startEmailOutboxWorker } from './services/email-outbox.service.js';
 
 const startServer = async () => {
   try {
     await connectDB();
     await connectRedis();
+    startEmailOutboxWorker();
 
     const server = app.listen(env.port || 8000, () => {
       console.log(`Server is running on port: ${env.port || 8000}`);

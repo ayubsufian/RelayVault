@@ -7,10 +7,10 @@ import { MfaFactor } from '../models/mfa-factor.model.js';
 import { MfaChallenge } from '../models/mfa-challenge.model.js';
 import { MfaRecoveryCode } from '../models/mfa-recovery-code.model.js';
 import {
-  sendPasswordResetEmail,
-  sendVerificationEmail,
-  sendMfaChangedEmail,
-} from './email.service.js';
+  enqueuePasswordResetEmail,
+  enqueueVerificationEmail,
+  enqueueMfaChangedEmail,
+} from './email-outbox.service.js';
 import { env } from '../config/env.js';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
@@ -271,28 +271,34 @@ const requestPasswordResetService = async (email) => {
 
   const rawToken = crypto.randomBytes(32).toString('hex');
   const tokenHash = hashToken(rawToken);
-
-  await PasswordReset.deleteMany({ userId: user._id });
-
-  const resetRequest = await PasswordReset.create({
-    userId: user._id,
-    tokenHash,
-    expiresAt: new Date(Date.now() + 15 * 60 * 1000),
-  });
+  const dbSession = await mongoose.startSession();
 
   try {
-    const messageId = await sendPasswordResetEmail(user.email, rawToken);
-    console.log(`Password reset email sent: ${messageId}`);
-  } catch (error) {
-    await PasswordReset.deleteOne({
-      _id: resetRequest._id,
-    });
+    await dbSession.withTransaction(async () => {
+      await PasswordReset.deleteMany({ userId: user._id }, { session: dbSession });
 
+      const [resetRequest] = await PasswordReset.create([{
+        userId: user._id,
+        tokenHash,
+        expiresAt: new Date(Date.now() + 15 * 60 * 1000),
+      }], { session: dbSession });
+
+      await enqueuePasswordResetEmail({
+        aggregateId: user._id,
+        recipientEmail: user.email,
+        rawToken,
+        idempotencyKey: `password-reset:${resetRequest._id}`,
+        dbSession,
+      });
+    });
+  } catch (error) {
     throw new ServiceError(
-      'Password reset email could not be sent',
+      'Password reset email could not be queued',
       'EMAIL_DELIVERY_FAILED',
       { cause: error },
     );
+  } finally {
+    await dbSession.endSession();
   }
 };
 
@@ -357,30 +363,34 @@ const changePasswordService = async (userId, currentPassword, newPassword) => {
 const sendVerificationEmailService = async (user) => {
   const rawToken = crypto.randomBytes(32).toString('hex');
   const tokenHash = hashToken(rawToken);
-
-  await EmailVerification.deleteMany({
-    userId: user._id,
-  });
-
-  const verification = await EmailVerification.create({
-    userId: user._id,
-    tokenHash,
-    expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
-  });
+  const dbSession = await mongoose.startSession();
 
   try {
-    const messageId = await sendVerificationEmail(user.email, rawToken);
-    console.log(`Verification email sent: ${messageId}`);
-  } catch (error) {
-    await EmailVerification.deleteOne({
-      _id: verification._id,
-    });
+    await dbSession.withTransaction(async () => {
+      await EmailVerification.deleteMany({ userId: user._id }, { session: dbSession });
 
+      const [verification] = await EmailVerification.create([{
+        userId: user._id,
+        tokenHash,
+        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      }], { session: dbSession });
+
+      await enqueueVerificationEmail({
+        aggregateId: user._id,
+        recipientEmail: user.email,
+        rawToken,
+        idempotencyKey: `email-verification:${verification._id}`,
+        dbSession,
+      });
+    });
+  } catch (error) {
     throw new ServiceError(
-      'Verification email could not be sent',
+      'Verification email could not be queued',
       'EMAIL_DELIVERY_FAILED',
       { cause: error },
     );
+  } finally {
+    await dbSession.endSession();
   }
 };
 
@@ -776,6 +786,25 @@ const revokeActiveSessions = (userId, dbSession = null) => {
   return query;
 };
 
+const enqueueMfaChangedNotification = (user, action, dbSession = null) =>
+  enqueueMfaChangedEmail({
+    aggregateId: user._id,
+    recipientEmail: user.email,
+    action,
+    idempotencyKey: `mfa-changed:${user._id}:${action}:${crypto.randomUUID()}`,
+    dbSession,
+  });
+
+const withMfaTransaction = async (operation) => {
+  const dbSession = await mongoose.startSession();
+
+  try {
+    return await dbSession.withTransaction(() => operation(dbSession));
+  } finally {
+    await dbSession.endSession();
+  }
+};
+
 const createPendingTotpFactor = async (userId, email) => {
   if (!userId || !mongoose.isObjectIdOrHexString(userId)) {
     return { error: MFA_ERROR.INVALID };
@@ -834,19 +863,23 @@ const generateRecoveryCode = () => {
   return crypto.randomBytes(8).toString('hex').toUpperCase();
 };
 
-const createRecoveryCodesService = async (userId) => {
+const createRecoveryCodesService = async (userId, dbSession = null) => {
   const rawCodes = Array.from(
     { length: RECOVERY_CODE_COUNT },
     generateRecoveryCode,
   );
 
-  await MfaRecoveryCode.deleteMany({ userId });
+  await MfaRecoveryCode.deleteMany(
+    { userId },
+    dbSession ? { session: dbSession } : undefined,
+  );
 
   await MfaRecoveryCode.insertMany(
     rawCodes.map((code) => ({
       userId,
       codeHash: hashToken(code),
     })),
+    dbSession ? { session: dbSession } : undefined,
   );
 
   return rawCodes;
@@ -990,36 +1023,30 @@ const regenerateRecoveryCodesService = async ({
     return { error: MFA_ERROR.NOT_ENABLED };
   }
 
-  if (code) {
-    const result = await verifyCurrentTotpService(userId, code);
-
-    if (result.error) {
-      return result;
+  const recoveryCodes = await withMfaTransaction(async (dbSession) => {
+    if (code) {
+      const result = await verifyCurrentTotpService(userId, code, dbSession);
+      if (!result.success) return null;
+    } else {
+      const consumed = await consumeRecoveryCodeService(
+        userId,
+        recoveryCode,
+        dbSession,
+      );
+      if (!consumed) return null;
     }
 
-    if (!result.success) {
-      return { error: MFA_ERROR.INVALID };
-    }
-  } else {
-    const consumed = await consumeRecoveryCodeService(userId, recoveryCode);
+    const codes = await createRecoveryCodesService(userId, dbSession);
+    await revokeActiveSessions(userId, dbSession);
+    await enqueueMfaChangedNotification(
+      user,
+      'recovery-codes-regenerated',
+      dbSession,
+    );
+    return codes;
+  });
 
-    if (!consumed) {
-      return { error: MFA_ERROR.INVALID };
-    }
-  }
-
-  const recoveryCodes = await createRecoveryCodesService(userId);
-
-  await revokeActiveSessions(userId);
-
-  sendMfaChangedEmail(user.email, 'recovery-codes-regenerated').catch(
-    (error) => {
-      console.error('Recovery-code notification failed', {
-        userId: userId.toString(),
-        error,
-      });
-    },
-  );
+  if (!recoveryCodes) return { error: MFA_ERROR.INVALID };
 
   return {
     success: true,
@@ -1154,7 +1181,8 @@ const confirmMfaSetupService = async (userId, code) => {
     return { error: MFA_ERROR.INVALID };
   }
 
-  const enabledFactor = await MfaFactor.findOneAndUpdate(
+  const { recoveryCodes } = await withMfaTransaction(async (dbSession) => {
+    const enabledFactor = await MfaFactor.findOneAndUpdate(
     {
       _id: factor._id,
       userId,
@@ -1171,23 +1199,18 @@ const confirmMfaSetupService = async (userId, code) => {
     {
       new: true,
       runValidators: true,
+      session: dbSession,
     },
-  );
+    );
 
-  if (!enabledFactor) {
-    return { error: MFA_ERROR.INVALID };
-  }
+    if (!enabledFactor) {
+      throw new Error('MFA factor claim failed');
+    }
 
-  const recoveryCodes = await createRecoveryCodesService(userId);
-
-  await revokeActiveSessions(userId);
-
-  sendMfaChangedEmail(user.email, 'enabled').catch((error) => {
-    console.error('MFA notification failed', {
-      userId: user._id.toString(),
-      action: 'enabled',
-      error: error.message,
-    });
+    const recoveryCodes = await createRecoveryCodesService(userId, dbSession);
+    await revokeActiveSessions(userId, dbSession);
+    await enqueueMfaChangedNotification(user, 'enabled', dbSession);
+    return { recoveryCodes };
   });
 
   return {
@@ -1196,11 +1219,13 @@ const confirmMfaSetupService = async (userId, code) => {
   };
 };
 
-const verifyCurrentTotpService = async (userId, code) => {
-  const factor = await MfaFactor.findOne({
+const verifyCurrentTotpService = async (userId, code, dbSession = null) => {
+  const factorQuery = MfaFactor.findOne({
     userId,
     enabledAt: { $ne: null },
   });
+  if (dbSession) factorQuery.session(dbSession);
+  const factor = await factorQuery;
 
   if (!factor) {
     return { error: MFA_ERROR.NOT_ENABLED };
@@ -1233,6 +1258,7 @@ const verifyCurrentTotpService = async (userId, code) => {
     {
       new: true,
       runValidators: true,
+      ...(dbSession ? { session: dbSession } : {}),
     },
   );
 
@@ -1358,12 +1384,6 @@ const startMfaReplacementService = async (userId, code) => {
     return { error: MFA_ERROR.INVALID };
   }
 
-  const currentFactorResult = await verifyCurrentTotpService(userId, code);
-
-  if (currentFactorResult.error) {
-    return currentFactorResult;
-  }
-
   const secret = authenticator.generateSecret();
   const otpauthUrl = authenticator.keyuri(
     `user-${userId}`,
@@ -1372,22 +1392,43 @@ const startMfaReplacementService = async (userId, code) => {
   );
   const qrCode = await QRCode.toDataURL(otpauthUrl);
 
-  const factor = await MfaFactor.findOneAndUpdate(
-    {
+  const factor = await withMfaTransaction(async (dbSession) => {
+    const currentFactorResult = await verifyCurrentTotpService(
       userId,
-      enabledAt: { $ne: null },
-    },
-    {
-      $set: {
-        pendingSecretEncrypted: encryptSecret(secret),
-        pendingCreatedAt: new Date(),
+      code,
+      dbSession,
+    );
+
+    if (currentFactorResult.error) {
+      return currentFactorResult;
+    }
+
+    const updatedFactor = await MfaFactor.findOneAndUpdate(
+      {
+        userId,
+        enabledAt: { $ne: null },
       },
-    },
-    {
-      new: true,
-      runValidators: true,
-    },
-  );
+      {
+        $set: {
+          pendingSecretEncrypted: encryptSecret(secret),
+          pendingCreatedAt: new Date(),
+        },
+      },
+      {
+        new: true,
+        runValidators: true,
+        session: dbSession,
+      },
+    );
+
+    if (!updatedFactor) {
+      return { error: MFA_ERROR.NOT_ENABLED };
+    }
+
+    return updatedFactor;
+  });
+
+  if (factor?.error) return factor;
 
   if (!factor) {
     return { error: MFA_ERROR.NOT_ENABLED };
@@ -1440,7 +1481,8 @@ const confirmMfaReplacementService = async (userId, code) => {
     return { error: MFA_ERROR.INVALID };
   }
 
-  const updatedFactor = await MfaFactor.findOneAndUpdate(
+  await withMfaTransaction(async (dbSession) => {
+    const updatedFactor = await MfaFactor.findOneAndUpdate(
     {
       _id: factor._id,
       userId,
@@ -1459,20 +1501,16 @@ const confirmMfaReplacementService = async (userId, code) => {
     {
       new: true,
       runValidators: true,
+      session: dbSession,
     },
-  );
+    );
 
-  if (!updatedFactor) {
-    return { error: MFA_ERROR.INVALID };
-  }
+    if (!updatedFactor) {
+      throw new Error('MFA factor replacement failed');
+    }
 
-  await revokeActiveSessions(userId);
-
-  sendMfaChangedEmail(user.email, 'replaced').catch((error) => {
-    console.error('MFA replacement notification failed', {
-      userId: userId.toString(),
-      error,
-    });
+    await revokeActiveSessions(userId, dbSession);
+    await enqueueMfaChangedNotification(user, 'replaced', dbSession);
   });
 
   return { success: true };
@@ -1541,7 +1579,8 @@ const disableMfaService = async ({
     return { error: MFA_ERROR.INVALID };
   }
 
-  const claimedFactor = await MfaFactor.findOneAndUpdate(
+  await withMfaTransaction(async (dbSession) => {
+    const claimedFactor = await MfaFactor.findOneAndUpdate(
     {
       _id: factor._id,
       userId,
@@ -1554,27 +1593,20 @@ const disableMfaService = async ({
     {
       new: true,
       runValidators: true,
+      session: dbSession,
     },
-  );
+    );
 
-  if (!claimedFactor) {
-    return { error: MFA_ERROR.INVALID };
-  }
+    if (!claimedFactor) {
+      throw new Error('MFA factor claim failed');
+    }
 
-  await MfaFactor.deleteOne({
-    _id: factor._id,
-    userId,
-  });
+    await MfaFactor.deleteOne({ _id: factor._id, userId }, { session: dbSession });
 
-  await MfaRecoveryCode.deleteMany({ userId });
+    await MfaRecoveryCode.deleteMany({ userId }, { session: dbSession });
 
-  await revokeActiveSessions(userId);
-
-  sendMfaChangedEmail(user.email, 'disabled').catch((error) => {
-    console.error('MFA disable notification failed', {
-      userId: userId.toString(),
-      error,
-    });
+    await revokeActiveSessions(userId, dbSession);
+    await enqueueMfaChangedNotification(user, 'disabled', dbSession);
   });
 
   return { success: true };

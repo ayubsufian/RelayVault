@@ -8,7 +8,13 @@ const escapeHtml = (value) =>
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#39;');
 
-const sendBrevoEmail = async ({ to, subject, textContent, htmlContent }) => {
+const sendBrevoEmail = async ({
+  to,
+  subject,
+  textContent,
+  htmlContent,
+  idempotencyKey,
+}) => {
   const response = await fetch('https://api.brevo.com/v3/smtp/email', {
     method: 'POST',
     headers: {
@@ -25,6 +31,9 @@ const sendBrevoEmail = async ({ to, subject, textContent, htmlContent }) => {
       subject,
       textContent,
       htmlContent,
+      ...(idempotencyKey
+        ? { headers: { IdempotencyKey: idempotencyKey } }
+        : {}),
     }),
   });
 
@@ -38,12 +47,12 @@ const sendBrevoEmail = async ({ to, subject, textContent, htmlContent }) => {
   return data.messageId;
 };
 
-const sendPasswordResetEmail = async (email, rawToken) => {
+const sendPasswordResetEmail = async (email, rawToken, options = {}) => {
   const resetUrl =
     `${env.clientUrl}/reset-password?token=` + encodeURIComponent(rawToken);
   const safeResetUrl = escapeHtml(resetUrl);
 
-  await sendBrevoEmail({
+  return sendBrevoEmail({
     to: email,
     subject: 'Reset your password',
     textContent: [
@@ -62,10 +71,11 @@ const sendPasswordResetEmail = async (email, rawToken) => {
           <p>This link expires in 15 minutes.</p>
           <p>If you did not request this, you can ignore this email.</p>
         `,
+    idempotencyKey: options.idempotencyKey,
   });
 };
 
-const sendVerificationEmail = async (email, rawToken) => {
+const sendVerificationEmail = async (email, rawToken, options = {}) => {
   const verificationUrl =
     `${env.clientUrl}/verify-email?token=` + encodeURIComponent(rawToken);
   const safeVerificationUrl = escapeHtml(verificationUrl);
@@ -86,10 +96,11 @@ const sendVerificationEmail = async (email, rawToken) => {
           </p>
           <p>This link expires in 24 hours.</p>
         `,
+    idempotencyKey: options.idempotencyKey,
   });
 };
 
-const sendMfaChangedEmail = async (email, action) => {
+const sendMfaChangedEmail = async (email, action, options = {}) => {
   const actionTextByType = {
     enabled: 'enabled',
     replaced: 'replaced',
@@ -105,7 +116,7 @@ const sendMfaChangedEmail = async (email, action) => {
 
   const safeActionText = escapeHtml(actionText);
 
-  await sendBrevoEmail({
+  return sendBrevoEmail({
     to: email,
     subject: 'Your MFA settings changed',
     textContent: [
@@ -120,16 +131,20 @@ const sendMfaChangedEmail = async (email, action) => {
         support immediately.
       </p>
     `,
+    idempotencyKey: options.idempotencyKey,
   });
 };
 
-const sendHandoffEmail = async (email, { title, redemptionUrl, expiresAt }) => {
+const sendHandoffEmail = async (
+  email,
+  { title, redemptionUrl, expiresAt, idempotencyKey },
+) => {
   const expiryText = new Date(expiresAt).toISOString();
   const safeTitle = escapeHtml(title);
   const safeRedemptionUrl = escapeHtml(redemptionUrl);
   const safeExpiryText = escapeHtml(expiryText);
 
-  await sendBrevoEmail({
+  return sendBrevoEmail({
     to: email,
     subject: 'You received a RelayVault handoff',
     textContent: [
@@ -148,6 +163,7 @@ const sendHandoffEmail = async (email, { title, redemptionUrl, expiresAt }) => {
       <p>This link can be used once and expires at ${safeExpiryText}.</p>
       <p>Do not forward this link. RelayVault will never ask for your password through this email.</p>
     `,
+    idempotencyKey,
   });
 };
 

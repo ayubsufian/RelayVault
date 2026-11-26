@@ -3,7 +3,8 @@ import mongoose from 'mongoose';
 import { Handoff } from '../models/handoff.model.js';
 import { HandoffToken } from '../models/handoff-token.model.js';
 import { HandoffEvent } from '../models/handoff-event.model.js';
-import { sendHandoffEmail } from './email.service.js';
+import { enqueueHandoffEmail } from './email-outbox.service.js';
+import { EmailOutbox } from '../models/email-outbox.model.js';
 import { encryptHandoff, decryptHandoff } from '../utils/secret-crypto.js';
 import { hashToken } from '../utils/token.js';
 import { env } from '../config/env.js';
@@ -165,6 +166,23 @@ const getHandoffService = async (ownerId, handoffId) => {
   return toOwnerResponse(handoff);
 };
 
+const getHandoffDeliveryStatusService = async (ownerId, handoffId) => {
+  assertOwnerId(ownerId);
+  assertHandoffId(handoffId);
+
+  const handoff = await Handoff.exists({ _id: handoffId, ownerId });
+  if (!handoff) {
+    throw new ServiceError('Handoff not found', 'HANDOFF_NOT_FOUND');
+  }
+
+  const job = await EmailOutbox.findOne({ aggregateId: handoffId })
+    .sort({ createdAt: -1 })
+    .select('status attempts nextAttemptAt sentAt completedAt lastError providerMessageId')
+    .lean();
+
+  return job || { status: 'not-shared' };
+};
+
 const updateHandoffService = async (ownerId, handoffId, updates) => {
   assertOwnerId(ownerId);
   assertHandoffId(handoffId);
@@ -260,7 +278,6 @@ const shareHandoffService = async (ownerId, handoffId, metadata = {}) => {
 
   const dbSession = await mongoose.startSession();
   let sharedHandoff;
-  let sharedEventId;
 
   try {
     await dbSession.withTransaction(async () => {
@@ -269,6 +286,16 @@ const shareHandoffService = async (ownerId, handoffId, metadata = {}) => {
         [{ handoffId: handoff._id, tokenHash, expiresAt: handoff.expiresAt }],
         { session: dbSession },
       );
+
+      await enqueueHandoffEmail({
+        handoffId: handoff._id,
+        recipientEmail: handoff.recipientEmail,
+        title: handoff.title,
+        redemptionUrl: `${env.clientUrl}/redeem/${encodeURIComponent(rawToken)}`,
+        expiresAt: handoff.expiresAt,
+        idempotencyKey: `${handoff._id}:${tokenHash}`,
+        dbSession,
+      });
 
       sharedHandoff = await Handoff.findOneAndUpdate(
         {
@@ -286,50 +313,15 @@ const shareHandoffService = async (ownerId, handoffId, metadata = {}) => {
         throw new ServiceError('Handoff could not be shared', 'HANDOFF_SHARE_FAILED');
       }
 
-      const sharedEvent = await addEvent(
+      await addEvent(
         handoff._id,
         'shared',
         metadata,
         dbSession,
       );
-      sharedEventId = sharedEvent._id;
     });
   } finally {
     await dbSession.endSession();
-  }
-
-  const redemptionUrl = `${env.clientUrl}/redeem/${encodeURIComponent(rawToken)}`;
-
-  try {
-    await sendHandoffEmail(handoff.recipientEmail, {
-      title: handoff.title,
-      redemptionUrl,
-      expiresAt: handoff.expiresAt,
-    });
-  } catch (error) {
-    const cleanupSession = await mongoose.startSession();
-    try {
-      await cleanupSession.withTransaction(async () => {
-        await HandoffToken.deleteOne(
-          { handoffId: handoff._id, tokenHash },
-          { session: cleanupSession },
-        );
-        await Handoff.updateOne(
-          { _id: handoff._id, ownerId, status: 'active', viewedAt: null },
-          { $set: { status: 'draft', sharedAt: null } },
-          { session: cleanupSession },
-        );
-        if (sharedEventId) {
-          await HandoffEvent.deleteOne(
-            { _id: sharedEventId },
-            { session: cleanupSession },
-          );
-        }
-      });
-    } finally {
-      await cleanupSession.endSession();
-    }
-    throw error;
   }
 
   return toOwnerResponse(sharedHandoff);
@@ -441,6 +433,7 @@ export {
   createHandoffService,
   getHandoffsService,
   getHandoffService,
+  getHandoffDeliveryStatusService,
   updateHandoffService,
   shareHandoffService,
   revokeHandoffService,

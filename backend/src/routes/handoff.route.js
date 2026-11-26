@@ -3,6 +3,7 @@ import {
   createHandoff,
   getHandoffs,
   getHandoff,
+  getHandoffDeliveryStatus,
   updateHandoff,
   revokeHandoff,
   shareHandoff,
@@ -17,9 +18,11 @@ const router = Router();
 router.post('/', requireAuth, createHandoff);
 router.get('/', requireAuth, getHandoffs);
 router.post('/redeem/:token', handoffLimiter, redeemHandoff);
+router.get('/:id/delivery', requireAuth, getHandoffDeliveryStatus);
 router.get('/:id', requireAuth, getHandoff);
 router.patch('/:id', requireAuth, requireRecentAuth, updateHandoff);
 router.post('/:id/share', requireAuth, requireRecentAuth, handoffLimiter, shareHandoff);
+router.post('/:id/resend', requireAuth, requireRecentAuth, handoffLimiter, shareHandoff);
 router.post('/:id/revoke', requireAuth, requireRecentAuth, revokeHandoff);
 
 export default router;
