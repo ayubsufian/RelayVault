@@ -8,7 +8,9 @@
   "main": "index.js",
   "scripts": {
     "start": "node backend/src/index.js",
-    "dev": "nodemon backend/src/index.js"
+    "dev": "nodemon backend/src/index.js",
+    "docs:validate": "node backend/scripts/validate-openapi.js",
+    "test": "npm run docs:validate"
   },
   "dependencies": {
     "bcrypt": "^6.0.0",
@@ -23,6 +25,8 @@
     "otplib": "^13.6.0",
     "qrcode": "^1.5.4",
     "rate-limit-redis": "^6.0.2",
-    "redis": "^6.4.0"
+    "redis": "^6.4.0",
+    "swagger-ui-dist": "^5.36.0",
+    "swagger-ui-express": "^5.0.1"
   }
 }

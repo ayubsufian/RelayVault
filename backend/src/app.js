@@ -5,6 +5,7 @@ import cookieParser from 'cookie-parser';
 import { notFound, errorHandler } from './middleware/error.middleware.js';
 import { globalApiLimiter } from './middleware/rate-limit.middleware.js';
 import { env } from './config/env.js';
+import docsRouter from './routes/docs.route.js';
 
 const app = express();
 
@@ -13,6 +14,7 @@ app.set('trust proxy', env.trustProxy);
 app.use(express.json());
 app.use(cookieParser());
 app.use('/api', globalApiLimiter);
+app.use('/api/docs', docsRouter);
 
 app.use('/api/v1/auth', authRouter);
 app.use('/api/v1/handoffs', handoffRouter);
